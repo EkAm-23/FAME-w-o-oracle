@@ -10,7 +10,7 @@ cd "$(dirname "$0")"
 # rather than an external env path.
 PY="${PY:-python}"
 SEQ="${SEQ:-0}"
-SEEDS=(${SEEDS:-1 2 3})
+SEEDS=(${SEEDS:-1})
 GPU="${GPU:-0}"
 TSTEPS="${TSTEPS:-3500000}"   # full protocol: 7 tasks x 500k
 SWITCH="${SWITCH:-500000}"
