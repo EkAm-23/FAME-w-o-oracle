@@ -18,6 +18,7 @@ Legacy: `--use_swoks 0/1` is still accepted as an alias for
 """
 
 import copy
+import glob
 import os
 import pickle
 import random
@@ -123,6 +124,14 @@ def build_parser():
 
     p.add_argument('--results_dir', type=str, default="results")
     p.add_argument('--models_dir', type=str, default="models")
+
+    # --- Checkpointing ---
+    p.add_argument('--checkpoint_dir', type=str, default=None,
+                   help="Directory to save/load training checkpoints. "
+                        "If None, checkpointing is disabled.")
+    p.add_argument('--checkpoint_interval', type=int, default=100000,
+                   help="Save a checkpoint every this many training steps "
+                        "(default: 100 000).")
 
     return p
 
@@ -478,6 +487,100 @@ class FameBoundaryTrigger:
 # ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# Checkpointing helpers
+# ----------------------------------------------------------------------
+def _checkpoint_path(checkpoint_dir: str, filename: str) -> str:
+    """Return the path for the latest checkpoint file for this run."""
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    return os.path.join(checkpoint_dir, f"{filename}_checkpoint.pkl")
+
+
+def save_checkpoint(
+    path: str,
+    *,
+    step: int,
+    gameid: int,
+    avg_return: float,
+    epi_return: float,
+    meta_warmup: int,
+    returns_array,
+    oracle_boundaries,
+    detected_boundaries,
+    detection_log,
+    flag_history,
+    Games,
+    snapshots,
+    Fast_Learner,
+    Fast_opt,
+    Target_net,
+    Meta_Learner,
+    Meta_opt,
+    Meta_scheduler,
+    exp_replay_fast,
+    exp_replay_fast2meta,
+    exp_replay_meta,
+    detector,
+    elapsed_time_so_far: float,
+) -> None:
+    """Persist all training state needed to resume from *step*."""
+    tmp_path = path + ".tmp"
+    blob = {
+        "step": step,
+        "gameid": gameid,
+        "avg_return": avg_return,
+        "epi_return": epi_return,
+        "meta_warmup": meta_warmup,
+        "returns_array": returns_array,
+        "oracle_boundaries": list(oracle_boundaries),
+        "detected_boundaries": list(detected_boundaries),
+        "detection_log": list(detection_log),
+        "flag_history": list(flag_history),
+        "Games": list(Games),
+        "snapshots": [(s, sd) for s, sd in snapshots],
+        # Neural-network weights + optimiser states
+        "Fast_Learner_sd": Fast_Learner.state_dict(),
+        "Fast_opt_sd": Fast_opt.state_dict(),
+        "Target_net_sd": Target_net.state_dict(),
+        "Meta_Learner_sd": Meta_Learner.state_dict(),
+        "Meta_opt_sd": Meta_opt.state_dict(),
+        "Meta_scheduler_sd": Meta_scheduler.state_dict(),
+        # Replay buffers stored as raw deque contents
+        "exp_replay_fast_mem": list(exp_replay_fast.memory),
+        "exp_replay_fast2meta_mem": list(exp_replay_fast2meta.memory),
+        "exp_replay_meta_mem": list(exp_replay_meta.memory),
+        # Detector internal state (optional -- may not be serialisable for
+        # all detector types; we catch exceptions and warn gracefully).
+        "detector_state": None,
+        # Accumulated wall-clock time from all previous sessions.
+        "elapsed_time_so_far": elapsed_time_so_far,
+    }
+    # Attempt to serialise the detector's own state.
+    if detector is not None:
+        try:
+            import io
+            buf = io.BytesIO()
+            pickle.dump(detector.core, buf)
+            blob["detector_state"] = buf.getvalue()
+        except Exception as exc:
+            print(f"[checkpoint] warning: could not serialise detector state: {exc}")
+    with open(tmp_path, "wb") as f:
+        pickle.dump(blob, f)
+    os.replace(tmp_path, path)  # atomic on POSIX
+    print(f"[checkpoint] saved -> {path}  (step={step})")
+
+
+def load_latest_checkpoint(checkpoint_dir: str, filename: str):
+    """Return the checkpoint dict if one exists, else None."""
+    path = _checkpoint_path(checkpoint_dir, filename)
+    if not os.path.exists(path):
+        return None, None
+    print(f"[checkpoint] loading -> {path}")
+    with open(path, "rb") as f:
+        blob = pickle.load(f)
+    return blob, path
+
+
 def main():
     args = build_parser().parse_args()
 
@@ -499,6 +602,9 @@ def main():
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     print("device =", device)
+
+    # Track wall-clock time; this accumulates across resumed sessions.
+    _session_start_time = time.time()
 
     detector_kind = resolve_detector_kind(args)
     mode_tag = detector_kind
@@ -547,7 +653,16 @@ def main():
     print(f"Run: {filename}")
     print(args)
 
-    # --- Initial env ---
+    # ------------------------------------------------------------------
+    # Try to resume from an existing checkpoint
+    # ------------------------------------------------------------------
+    _checkpoint_blob = None
+    if args.checkpoint_dir:
+        _checkpoint_blob, _ckpt_path = load_latest_checkpoint(
+            args.checkpoint_dir, filename
+        )
+
+    # --- Initial env (always needed for shapes even during resume) ---
     gameid = 0
     env = CL_envs_func_replacement(seq=args.seq, game_id=gameid,
                                    seed=args.seed)
@@ -631,16 +746,72 @@ def main():
 
     avg_return = 0.0
     epi_return = 0.0
+    meta_warmup = 0
+    step = 0
+    _elapsed_time_prev_sessions = 0.0  # seconds accumulated before this session
+
+    # ------------------------------------------------------------------
+    # Restore checkpoint (if one was found)
+    # ------------------------------------------------------------------
+    if _checkpoint_blob is not None:
+        ck = _checkpoint_blob
+        step = ck["step"]
+        gameid = ck["gameid"]
+        avg_return = ck["avg_return"]
+        epi_return = ck["epi_return"]
+        meta_warmup = ck["meta_warmup"]
+        returns_array = ck["returns_array"]
+        oracle_boundaries = ck["oracle_boundaries"]
+        detected_boundaries = ck["detected_boundaries"]
+        detection_log = ck["detection_log"]
+        flag_history = ck["flag_history"]
+        Games = ck["Games"]
+        snapshots[:] = ck["snapshots"]
+        _elapsed_time_prev_sessions = ck.get("elapsed_time_so_far", 0.0)
+
+        # Restore network weights
+        Fast_Learner.load_state_dict(ck["Fast_Learner_sd"])
+        Fast_opt.load_state_dict(ck["Fast_opt_sd"])
+        Target_net.load_state_dict(ck["Target_net_sd"])
+        Meta_Learner.load_state_dict(ck["Meta_Learner_sd"])
+        Meta_opt.load_state_dict(ck["Meta_opt_sd"])
+        Meta_scheduler.load_state_dict(ck["Meta_scheduler_sd"])
+
+        # Restore replay buffers
+        exp_replay_fast.memory.clear()
+        exp_replay_fast.memory.extend(ck["exp_replay_fast_mem"])
+        exp_replay_fast2meta.memory.clear()
+        exp_replay_fast2meta.memory.extend(ck["exp_replay_fast2meta_mem"])
+        exp_replay_meta.memory.clear()
+        exp_replay_meta.memory.extend(ck["exp_replay_meta_mem"])
+
+        # Restore detector internal state (best-effort)
+        if detector is not None and ck.get("detector_state") is not None:
+            try:
+                import io
+                restored_core = pickle.load(io.BytesIO(ck["detector_state"]))
+                detector.core = restored_core
+                print("[checkpoint] detector state restored.")
+            except Exception as exc:
+                print(f"[checkpoint] warning: could not restore detector state: {exc}")
+
+        # Restore environment to the correct game
+        env = CL_envs_func_replacement(seq=args.seq, game_id=gameid,
+                                       seed=args.seed)
+        print(f"[checkpoint] Resumed from step {step}, gameid={gameid}, "
+              f"prev elapsed={_elapsed_time_prev_sessions:.1f}s")
+    else:
+        print(f"[checkpoint] No checkpoint found; starting fresh.")
+
     cs = env.reset()
     print(f"##### Env {gameid+1}: {env.game_name}")
 
-    pbar = tqdm(total=args.t_steps)
-    meta_warmup = 0
-    step = 0
+    pbar = tqdm(total=args.t_steps, initial=step)
 
     num_envs = max(1, args.t_steps // args.switch)
     is_oracle = detector_kind == "oracle"
     is_boundary_free = not is_oracle
+    _last_checkpoint_step = step  # track when we last saved
 
     # ------------------------------------------------------------------
     # Main interaction loop
@@ -859,7 +1030,49 @@ def main():
         step += 1
         pbar.update(1)
 
+        # ---------- periodic checkpoint ----------
+        if (args.checkpoint_dir
+                and step - _last_checkpoint_step >= args.checkpoint_interval):
+            _elapsed_now = (_elapsed_time_prev_sessions
+                            + time.time() - _session_start_time)
+            save_checkpoint(
+                _checkpoint_path(args.checkpoint_dir, filename),
+                step=step,
+                gameid=gameid,
+                avg_return=avg_return,
+                epi_return=epi_return,
+                meta_warmup=meta_warmup,
+                returns_array=returns_array,
+                oracle_boundaries=oracle_boundaries,
+                detected_boundaries=detected_boundaries,
+                detection_log=detection_log,
+                flag_history=flag_history,
+                Games=Games,
+                snapshots=snapshots,
+                Fast_Learner=Fast_Learner,
+                Fast_opt=Fast_opt,
+                Target_net=Target_net,
+                Meta_Learner=Meta_Learner,
+                Meta_opt=Meta_opt,
+                Meta_scheduler=Meta_scheduler,
+                exp_replay_fast=exp_replay_fast,
+                exp_replay_fast2meta=exp_replay_fast2meta,
+                exp_replay_meta=exp_replay_meta,
+                detector=detector,
+                elapsed_time_so_far=_elapsed_now,
+            )
+            _last_checkpoint_step = step
+
     pbar.close()
+
+    # Compute total training time (accumulated + this session)
+    _total_training_time = (_elapsed_time_prev_sessions
+                            + time.time() - _session_start_time)
+    _total_training_time_str = time.strftime(
+        "%H:%M:%S", time.gmtime(_total_training_time)
+    )
+    print(f"Total training time: {_total_training_time_str} "
+          f"({_total_training_time:.1f}s)")
 
     # ------------------------------------------------------------------
     # Save results
@@ -876,6 +1089,8 @@ def main():
             "args": vars(args),
             "mode": mode_tag,
             "detector_stats": detector.stats() if detector is not None else None,
+            "total_training_time_seconds": _total_training_time,
+            "total_training_time_hms": _total_training_time_str,
         }
         out_path = os.path.join(args.results_dir, f"{filename}_returns.pkl")
         with open(out_path, "wb") as f:
@@ -900,6 +1115,8 @@ def main():
     print("Games:", Games)
     print("Oracle boundaries:", oracle_boundaries)
     print("Detected boundaries:", detected_boundaries)
+    print(f"Total training time: {_total_training_time_str} "
+          f"({_total_training_time:.1f}s)")
     print(args)
 
 
