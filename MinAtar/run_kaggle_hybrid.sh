@@ -36,10 +36,12 @@ for s in "${SEEDS[@]}"; do
         --swoks_stable_phase 36000 --swoks_interval 240 \
         --swoks_warmup 5000 \
         --swoks_snapshot 1 --swoks_snapshot_interval 6000 \
+        --swoks_max_wait 0 \
         --imp_L_D 1200 --imp_alpha 1e-3 \
         --imp_stable_phase 36000 --imp_interval 240 \
         --imp_warmup 5000 --imp_lr 1e-4 \
         --imp_update_every 16 \
+        --imp_score_batch_size 16 \
         --hyb_tau_imp_loose 1e-2 \
         --hyb_tau_imp_strict 1e-6 \
         --hyb_tau_stat_strict 1e-3 \

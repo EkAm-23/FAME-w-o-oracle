@@ -160,6 +160,11 @@ class ImplicitDetector:
         Train the TSN once every this many env steps.
     batch_size : int
         Minibatch size for TSN training.
+    score_batch_size : int or None
+        Number of transitions to accumulate before doing a single batched
+        forward pass to compute their errors.  Defaults to ``update_every``.
+        Increasing this reduces PyTorch dispatch overhead at the cost of
+        slightly coarser (but statistically identical) score granularity.
     device : str
         torch device (cpu/cuda).
     seed : int
@@ -179,6 +184,7 @@ class ImplicitDetector:
         replay_capacity: Optional[int] = None,
         update_every: int = 16,
         batch_size: int = 64,
+        score_batch_size: Optional[int] = None,
         device: str = "cpu",
         seed: int = 0,
     ):
@@ -193,6 +199,12 @@ class ImplicitDetector:
         self.lr = float(lr)
         self.update_every = int(update_every)
         self.batch_size = int(batch_size)
+        # Batched scoring: accumulate this many transitions before a single
+        # batched TSN forward pass.  Defaults to update_every so that the
+        # scoring flush and training step happen at the same cadence,
+        # avoiding redundant forward passes.
+        self.score_batch_size = int(score_batch_size) if score_batch_size \
+            else int(update_every)
         self.device = torch.device(device)
 
         torch.manual_seed(seed)
@@ -203,6 +215,12 @@ class ImplicitDetector:
 
         cap = int(replay_capacity) if replay_capacity else 4 * self.L_D
         self._replay = deque(maxlen=cap)
+
+        # Buffer for batched error scoring.  Transitions accumulate here
+        # until score_batch_size entries are ready, then one batched forward
+        # pass computes all their errors in one call (replacing the old
+        # per-step single-sample _compute_errors approach).
+        self._score_buf: list = []
 
         # Windows of per-step task-signature scores S_t.
         self._scores = deque(maxlen=2 * self.L_D)
@@ -257,18 +275,13 @@ class ImplicitDetector:
         next_phi = np.asarray(next_phi, dtype=np.float32).ravel()
         self._replay.append((phi, int(action), float(reward), next_phi))
 
-        # Per-step prediction errors + task-signature score.
-        err_r, err_d = self._compute_errors(phi, int(action), float(reward),
-                                            next_phi)
-        self._w_r.update(err_r)
-        self._w_d.update(err_d)
-        z_r = max(0.0, (err_r - self._w_r.mean) / (self._w_r.std + 1e-8))
-        z_d = max(0.0, (err_d - self._w_d.mean) / (self._w_d.std + 1e-8))
-        S_t = z_r + z_d
-        self._scores.append(S_t)
-        self.last_score = S_t
-        self.last_err_r = err_r
-        self.last_err_d = err_d
+        # Batched error scoring: buffer the transition and flush once we
+        # have score_batch_size entries.  This replaces the old per-step
+        # single-sample _compute_errors() call, reducing PyTorch dispatch
+        # overhead by score_batch_size x.
+        self._score_buf.append((phi, int(action), float(reward), next_phi))
+        if len(self._score_buf) >= self.score_batch_size:
+            self._flush_score_buf()
 
         # Online training of the TSN on fresh transitions.
         if self.ts % self.update_every == 0 and len(self._replay) >= self.batch_size:
@@ -287,6 +300,7 @@ class ImplicitDetector:
             self._w_r = Welford()
             self._w_d = Welford()
             self._scores.clear()
+            self._score_buf.clear()   # discard any pre-flush buffered scores
             self._warmup_reset_done = True
             return False
         if self.ts % self.detection_interval != 0:
@@ -347,8 +361,52 @@ class ImplicitDetector:
         v[int(a)] = 1.0
         return v
 
+    def _flush_score_buf(self):
+        """Run a single batched TSN forward pass over all buffered transitions,
+        update Welford stats, and append per-transition scores to self._scores.
+
+        This replaces the old per-step single-sample _compute_errors() pattern.
+        By batching score_batch_size transitions together we reduce PyTorch
+        dispatch calls by score_batch_size x while producing identical per-step
+        scores (same arithmetic, same Welford update order).
+        """
+        if not self._score_buf:
+            return
+        batch = self._score_buf
+        self._score_buf = []
+
+        phis = np.stack([b[0] for b in batch])          # (K, latent_dim)
+        acts = np.stack([self._one_hot(b[1]) for b in batch])  # (K, num_actions)
+        rews = np.array([b[2] for b in batch], dtype=np.float32)  # (K,)
+        nphs = np.stack([b[3] for b in batch])          # (K, latent_dim)
+
+        self.net.eval()
+        with torch.no_grad():
+            phi_t = torch.from_numpy(phis).to(self.device)
+            act_t = torch.from_numpy(acts).to(self.device)
+            nph_t = torch.from_numpy(nphs).to(self.device)
+            r_hat, n_hat = self.net(phi_t, act_t)
+            # Move results to numpy once (avoids repeated .item() calls)
+            err_rs = (r_hat.squeeze(-1).cpu().numpy() - rews) ** 2   # (K,)
+            err_ds = ((n_hat.cpu().numpy() - nphs) ** 2).mean(axis=1)  # (K,)
+
+        for err_r, err_d in zip(err_rs, err_ds):
+            err_r, err_d = float(err_r), float(err_d)
+            self._w_r.update(err_r)
+            self._w_d.update(err_d)
+            z_r = max(0.0, (err_r - self._w_r.mean) / (self._w_r.std + 1e-8))
+            z_d = max(0.0, (err_d - self._w_d.mean) / (self._w_d.std + 1e-8))
+            S_t = z_r + z_d
+            self._scores.append(S_t)
+            self.last_score = S_t
+            self.last_err_r = err_r
+            self.last_err_d = err_d
+
     def _compute_errors(self, phi, action, reward, next_phi):
-        """Single-sample prediction errors (used as the per-step drift feed)."""
+        """Single-sample prediction errors (kept for external callers / tests).
+
+        Not used by step() anymore — step() uses _flush_score_buf() instead.
+        """
         self.net.eval()
         with torch.no_grad():
             p = torch.from_numpy(phi).to(self.device).unsqueeze(0)
@@ -385,6 +443,7 @@ class ImplicitDetector:
         self.detections.append(self.ts)
         self.last_shift_step = self.ts
         self._scores.clear()
+        self._score_buf.clear()   # discard pre-flush buffered transitions
         # Reset the cached p-value/score so a stale post-fire value doesn't
         # trip a downstream aggregator (e.g. HybridDetector) on the next tick.
         self.last_pval = 1.0

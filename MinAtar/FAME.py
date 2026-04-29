@@ -111,6 +111,10 @@ def build_parser():
     p.add_argument('--imp_replay', type=int, default=0,
                    help="0 -> 4*imp_L_D")
     p.add_argument('--imp_update_every', type=int, default=16)
+    p.add_argument('--imp_score_batch_size', type=int, default=0,
+                   help="Transitions to accumulate before one batched TSN "
+                        "forward pass for error scoring.  0 -> same as "
+                        "--imp_update_every (recommended).")
     p.add_argument('--imp_max_wait', type=int, default=0)
 
     # --- Hybrid-specific ---
@@ -183,6 +187,8 @@ def build_detector(kind, args, latent_dim, num_actions, device, on_suspect):
             seed=args.seed,
         ))
     if kind == "implicit":
+        _score_bs = args.imp_score_batch_size if args.imp_score_batch_size > 0 \
+            else None  # None -> ImplicitDetector defaults to update_every
         return DetectorAdapter("implicit", ImplicitDetector(
             latent_dim=latent_dim, num_actions=num_actions,
             L_D=args.imp_L_D, alpha=args.imp_alpha,
@@ -194,6 +200,7 @@ def build_detector(kind, args, latent_dim, num_actions, device, on_suspect):
             replay_capacity=(args.imp_replay if args.imp_replay > 0
                              else None),
             update_every=args.imp_update_every,
+            score_batch_size=_score_bs,
             device=str(device), seed=args.seed,
         ))
     if kind == "hybrid":
@@ -202,6 +209,8 @@ def build_detector(kind, args, latent_dim, num_actions, device, on_suspect):
         # their live `last_pval` to make firing decisions.  If the
         # inner auto-fired, it would reset its cached p-value and the
         # hybrid would lose the signal.
+        _score_bs = args.imp_score_batch_size if args.imp_score_batch_size > 0 \
+            else None
         imp = ImplicitDetector(
             latent_dim=latent_dim, num_actions=num_actions,
             L_D=args.imp_L_D, alpha=0.0,
@@ -213,6 +222,7 @@ def build_detector(kind, args, latent_dim, num_actions, device, on_suspect):
             replay_capacity=(args.imp_replay if args.imp_replay > 0
                              else None),
             update_every=args.imp_update_every,
+            score_batch_size=_score_bs,
             device=str(device), seed=args.seed,
         )
         swk = SwoksDetector(
@@ -813,6 +823,17 @@ def main():
     is_boundary_free = not is_oracle
     _last_checkpoint_step = step  # track when we last saved
 
+    # Pending-transition buffer for the buffered-next_phi optimisation.
+    # For implicit/hybrid detectors, computing Fast_Learner(ns) at every step
+    # is wasteful because phi(ns) at step t equals phi(cs) at step t+1 for all
+    # non-terminal transitions (done=False).  We buffer the previous step's
+    # (phi, action, reward, done, ns) and resolve next_phi at the start of the
+    # following step, when phi_{t+1} is already available from the policy
+    # forward pass.  Terminal steps (done=True) are the only exception: cs is
+    # reset so phi at t+1 != phi(ns), and we do a single targeted forward pass
+    # on the stored ns for those steps only.
+    _det_pending = None  # (phi, action, reward, done, ns) | None
+
     # ------------------------------------------------------------------
     # Main interaction loop
     # ------------------------------------------------------------------
@@ -828,6 +849,14 @@ def main():
             oracle_boundaries.append(step)
             print(f"[oracle switch @ step {step}] -> {env.game_name} "
                   f"(gameid={gameid})")
+            # Flush the pending-phi buffer.  cs is now the new env's reset
+            # state, so phi computed at this step will be phi(new_reset), not
+            # phi(ns_prev).  Without this flush, the buffered transition from
+            # the last step of the old task would be fed detector.step() with
+            # a next_phi from a completely different environment -- corrupting
+            # the dynamics error for that one boundary transition.
+            # The lost transition (1 per task switch) is negligible.
+            _det_pending = None
             if is_oracle:
                 # Oracle mode: fire FAME immediately.
                 avg_return = 0.0 if args.reset == 1 else avg_return
@@ -910,19 +939,55 @@ def main():
         returns_array[step] = avg_return
 
         # ---------- detection feed ----------
-        # Compute next_phi lazily (a single extra forward pass on `ns`).
-        # This is only done in boundary-free modes that need it.
         if is_boundary_free:
             if detector_kind == "swoks":
-                next_phi = None  # ignored by the adapter for swoks
-            else:
-                with torch.no_grad():
-                    _q, next_phi_t = Fast_Learner(
-                        _obs_to_tensor(ns, device), return_latent=True
-                    )
-                next_phi = next_phi_t[0].detach().cpu().numpy()
+                # SWOKS needs no next_phi -- call immediately.
+                fired = detector.step(phi, c_action, rew, None)
 
-            fired = detector.step(phi, c_action, rew, next_phi)
+            else:
+                # --- Buffered next_phi for implicit / hybrid ---
+                #
+                # We buffer the current step's transition and resolve next_phi
+                # at the *next* iteration, when phi_{t+1} is already available
+                # from the policy's own forward pass (zero extra cost).
+                #
+                # The only exception is a terminal step (done=True): after a
+                # done, cs is set to env.reset() so phi at t+1 is phi_reset,
+                # NOT phi(ns).  We detect this via prev_done and perform one
+                # targeted Fast_Learner(prev_ns) call only in that case.
+                #
+                # After a detection fires, trigger.run() replaces Fast_Learner
+                # weights and advances cs to a post-warmup state.  Any buffered
+                # transition from before the trigger would produce a next_phi
+                # computed by the NEW network on the POST-warmup cs, which is
+                # wrong.  We therefore flush _det_pending to None on every fire
+                # so the first post-detection step starts the buffer fresh.
+                fired = False
+                if _det_pending is not None:
+                    prev_phi, prev_action, prev_rew, prev_done, prev_ns = \
+                        _det_pending
+                    if not prev_done:
+                        # Non-terminal: cs at this step == ns from prev step,
+                        # so phi (just computed above) IS phi(prev_ns). Reuse.
+                        next_phi_prev = phi
+                    else:
+                        # Terminal: cs was reset to a new episode start, so
+                        # phi here is phi(reset_state) != phi(ns_prev).
+                        # Pay one forward pass only for this step.
+                        with torch.no_grad():
+                            _, _npt = Fast_Learner(
+                                _obs_to_tensor(prev_ns, device),
+                                return_latent=True
+                            )
+                        next_phi_prev = _npt[0].detach().cpu().numpy()
+
+                    fired = detector.step(
+                        prev_phi, prev_action, prev_rew, next_phi_prev
+                    )
+
+                # Buffer THIS step for the next iteration.
+                _det_pending = (phi, c_action, rew, done, ns)
+
             if fired:
                 true_switch = oracle_boundaries[-1] if oracle_boundaries else 0
                 # Per-detector introspection for the log line.
@@ -960,7 +1025,7 @@ def main():
                 if exp_replay_meta.size() > 0 or exp_replay_fast2meta.size() > 0:
                     print("  running meta update on streamed fast2meta")
                     Meta_opt_local = optim.Adam(Meta_Learner.parameters(),
-                                                lr=args.lr1)
+                                               lr=args.lr1)
                     Meta_scheduler_local = ExponentialLR(Meta_opt_local,
                                                          gamma=0.95)
                     if exp_replay_meta.size() >= args.batch_size:
@@ -1003,6 +1068,10 @@ def main():
                 }
                 entry.update(fire_meta)
                 detection_log.append(entry)
+                # Flush the pending buffer: trigger.run() replaces Fast_Learner
+                # weights and advances cs, so the buffered phi would produce an
+                # incorrect next_phi on the next iteration.
+                _det_pending = None
 
         # ---------- end of task in oracle mode ----------
         # (Boundary-free modes update the meta learner at each detected

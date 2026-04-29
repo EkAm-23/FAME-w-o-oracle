@@ -40,6 +40,7 @@ for s in "${SEEDS[@]}"; do
         --imp_stable_phase 36000 --imp_interval 240 \
         --imp_warmup 5000 --imp_lr 1e-4 \
         --imp_update_every 16 \
+        --imp_score_batch_size 16 \
         --hyb_tau_imp_loose 1e-2 \
         --hyb_tau_imp_strict 1e-6 \
         --hyb_tau_stat_strict 1e-3 \
